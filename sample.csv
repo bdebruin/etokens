@@ -1,0 +1,5 @@
+model,prompt_tokens,completion_tokens,cached_tokens,cost
+claude-opus,50000,100000,10000,1.5
+claude-sonnet,500000,25000,0,0.85
+gpt-frontier,100000,50000,0,0.45
+gemini-pro,200000,10000,0,0.35

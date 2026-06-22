@@ -1,0 +1,200 @@
+{
+  "downgrade_map": {
+    "claude-3-opus": "claude-3-haiku",
+    "claude-opus-4": "claude-haiku-4",
+    "gemini-2.5-pro": "gemini-2.0-flash",
+    "gpt-4-turbo": "gpt-4o-mini",
+    "gpt-4o": "gpt-4o-mini",
+    "llama-3.1-405b": "llama-3.1-8b",
+    "mistral-large": "mistral-7b"
+  },
+  "meta": {
+    "note": "Static pricing. Update manually when provider prices change.",
+    "version": "2025-06-01",
+    "verified_on": "2026-06-21"
+  },
+  "models": {
+    "claude-3-haiku": {
+      "cached_input": 0.175,
+      "input": 0.25,
+      "output": 1.25,
+      "provider": "Anthropic",
+      "tier": "economy"
+    },
+    "claude-3-opus": {
+      "cached_input": 10.5,
+      "input": 15,
+      "output": 75,
+      "provider": "Anthropic",
+      "tier": "frontier"
+    },
+    "claude-3-sonnet": {
+      "cached_input": 2.1,
+      "input": 3,
+      "output": 15,
+      "provider": "Anthropic",
+      "tier": "mid"
+    },
+    "claude-haiku-4": {
+      "cached_input": 0.56,
+      "input": 0.8,
+      "output": 4,
+      "provider": "Anthropic",
+      "tier": "mid"
+    },
+    "claude-opus-4": {
+      "cached_input": 10.5,
+      "input": 15,
+      "output": 75,
+      "provider": "Anthropic",
+      "tier": "frontier"
+    },
+    "claude-sonnet-4": {
+      "cached_input": 2.1,
+      "input": 3,
+      "output": 15,
+      "provider": "Anthropic",
+      "tier": "mid"
+    },
+    "deepseek-chat": {
+      "cached_input": 0.027,
+      "input": 0.27,
+      "output": 1.1,
+      "provider": "OpenRouter",
+      "tier": "mid"
+    },
+    "deepseek-coder": {
+      "cached_input": 0.027,
+      "input": 0.27,
+      "output": 1.1,
+      "provider": "OpenRouter",
+      "tier": "mid"
+    },
+    "gemini-1.5-flash": {
+      "cached_input": 0,
+      "input": 0,
+      "output": 0.175,
+      "provider": "Google",
+      "tier": "economy"
+    },
+    "gemini-1.5-pro": {
+      "cached_input": 0.16,
+      "input": 1.25,
+      "output": 5,
+      "provider": "Google",
+      "tier": "mid"
+    },
+    "gemini-2.0-flash": {
+      "cached_input": 0,
+      "input": 0,
+      "output": 0.4,
+      "provider": "Google",
+      "tier": "mid"
+    },
+    "gemini-2.5-pro": {
+      "cached_input": 0.16,
+      "input": 1.25,
+      "output": 10,
+      "provider": "Google",
+      "tier": "frontier"
+    },
+    "gpt-3.5-turbo": {
+      "cached_input": 0.125,
+      "input": 0.5,
+      "output": 1.5,
+      "provider": "OpenAI",
+      "tier": "economy"
+    },
+    "gpt-4-turbo": {
+      "cached_input": 7.5,
+      "input": 10,
+      "output": 30,
+      "provider": "OpenAI",
+      "tier": "frontier"
+    },
+    "gpt-4o": {
+      "cached_input": 1.25,
+      "input": 2.5,
+      "output": 10,
+      "provider": "OpenAI",
+      "tier": "frontier"
+    },
+    "gpt-4o-mini": {
+      "cached_input": 0.075,
+      "input": 0.15,
+      "output": 0.6,
+      "provider": "OpenAI",
+      "tier": "mid"
+    },
+    "llama-3.1-405b": {
+      "cached_input": 0.35,
+      "input": 3.5,
+      "output": 3.5,
+      "provider": "OpenRouter",
+      "tier": "frontier"
+    },
+    "llama-3.1-70b": {
+      "cached_input": 0.065,
+      "input": 0.65,
+      "output": 2.75,
+      "provider": "OpenRouter",
+      "tier": "mid"
+    },
+    "llama-3.1-8b": {
+      "cached_input": 0.007,
+      "input": 0.065,
+      "output": 0.27,
+      "provider": "OpenRouter",
+      "tier": "economy"
+    },
+    "mistral-7b": {
+      "cached_input": 0.01,
+      "input": 0.1,
+      "output": 0.1,
+      "provider": "OpenRouter",
+      "tier": "economy"
+    },
+    "mistral-large": {
+      "cached_input": 0.2,
+      "input": 2,
+      "output": 6,
+      "provider": "OpenRouter",
+      "tier": "frontier"
+    },
+    "o1-mini": {
+      "cached_input": 0,
+      "input": 3,
+      "output": 12,
+      "provider": "OpenAI",
+      "tier": "mid"
+    },
+    "o1-preview": {
+      "cached_input": 0,
+      "input": 15,
+      "output": 60,
+      "provider": "OpenAI",
+      "tier": "frontier"
+    },
+    "qwen-2.5-72b": {
+      "cached_input": 0.09,
+      "input": 0.9,
+      "output": 0.9,
+      "provider": "OpenRouter",
+      "tier": "mid"
+    }
+  },
+  "tiers": {
+    "economy": {
+      "examples": "GPT-3.5 Turbo, Gemini 1.5 Flash, distilled models",
+      "label": "Economy"
+    },
+    "frontier": {
+      "examples": "GPT-4o, Claude Opus 4, Gemini 2.5 Pro",
+      "label": "Frontier"
+    },
+    "mid": {
+      "examples": "GPT-4o-mini, Claude Haiku 4, Gemini 2.0 Flash",
+      "label": "Mid-range"
+    }
+  }
+}
