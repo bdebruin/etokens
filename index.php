@@ -87,6 +87,18 @@ $CANON_LABELS = [
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>etokens — token-cost audit</title>
+<meta property="og:type" content="website">
+<meta property="og:url" content="https://etokens.com/">
+<meta property="og:title" content="etokens — token-cost audit">
+<meta property="og:description" content="Find the money in your token bill. Drop in a usage export from OpenAI, Anthropic, or OpenRouter and get a spend map plus a recoverable-spend estimate. Processed in memory — nothing stored.">
+<meta property="og:image" content="https://etokens.com/og-image.png">
+<meta property="og:image:width" content="1200">
+<meta property="og:image:height" content="630">
+<meta property="og:image:alt" content="etokens — token-cost audit">
+<meta name="twitter:card" content="summary_large_image">
+<meta name="twitter:title" content="etokens — token-cost audit">
+<meta name="twitter:description" content="Find the money in your token bill. A token-cost audit for OpenAI, Anthropic, and OpenRouter usage.">
+<meta name="twitter:image" content="https://etokens.com/og-image.png">
 <style>
 @font-face{font-family:'Space Grotesk';src:url('/fonts/SpaceGrotesk.woff2') format('woff2');font-weight:400 700;font-display:swap}
 @font-face{font-family:'Hanken Grotesk';src:url('/fonts/HankenGrotesk.woff2') format('woff2');font-weight:400 600;font-display:swap}
