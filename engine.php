@@ -1,15 +1,15 @@
 <?php
 /**
- * engine.php — token-cost audit engine.
- * No external dependencies. No network calls. No API keys.
- * Pure: CSV in -> per-model aggregation -> waste-detection rules -> structured findings.
+ * engine.php — token-cost audit engine (clean rebuild).
+ * Reads the nested pricing.json: { meta, tiers, models{id:{provider,input,output,cached_input,tier}}, downgrade_map{id:id} }.
+ * Pure: CSV in -> per-model aggregation -> waste rules -> flat structured report. No sessions, no storage, no network.
  */
 
 class TokenAudit
 {
-    private array $pricing;
+    private array $models;     // id => {provider,input,output,cached_input,tier}
+    private array $downgrade;  // id => cheaper-id
 
-    /** canonical field => known header aliases (normalized, case-insensitive) */
     private array $aliases = [
         'model'         => ['model', 'model_id', 'model_name'],
         'input_tokens'  => ['input_tokens', 'prompt_tokens', 'tokens_prompt', 'n_context_tokens_total', 'context_tokens', 'input'],
@@ -17,20 +17,14 @@ class TokenAudit
         'cached_tokens' => ['cached_tokens', 'cache_read_tokens', 'cache_read_input_tokens', 'cached', 'tokens_cached'],
         'cost'          => ['cost', 'amount', 'spend', 'total_cost', 'usd', 'cost_usd', 'cost_total'],
         'count'         => ['count', 'n_requests', 'requests', 'num_requests'],
-        'date'          => ['date', 'day', 'timestamp', 'created_at', 'usage_date'],
-        'label'         => ['label', 'app', 'endpoint', 'project', 'tag'],
     ];
 
     public function __construct(string $pricingPath)
     {
         $raw = @file_get_contents($pricingPath);
-        $data = $raw ? json_decode($raw, true) : [];
-        if (isset($data['models'])) {
-            $this->pricing = $data['models'];
-        } else {
-            unset($data['_meta']);
-            $this->pricing = is_array($data) ? $data : [];
-        }
+        $j = $raw ? json_decode($raw, true) : [];
+        $this->models    = (is_array($j) && !empty($j['models']) && is_array($j['models'])) ? $j['models'] : [];
+        $this->downgrade = (is_array($j) && !empty($j['downgrade_map']) && is_array($j['downgrade_map'])) ? $j['downgrade_map'] : [];
     }
 
     private function norm(string $s): string
@@ -38,7 +32,6 @@ class TokenAudit
         return strtolower(trim(preg_replace('/[\s\-]+/', '_', $s)));
     }
 
-    /** Auto-map header row to canonical fields. Returns [canonical => column_index]. */
     public function detectColumns(array $header): array
     {
         $map = [];
@@ -46,16 +39,12 @@ class TokenAudit
         foreach ($this->aliases as $canon => $opts) {
             foreach ($opts as $opt) {
                 $i = array_search($this->norm($opt), $normHeader, true);
-                if ($i !== false) {
-                    $map[$canon] = $i;
-                    break;
-                }
+                if ($i !== false) { $map[$canon] = $i; break; }
             }
         }
         return $map;
     }
 
-    /** Do we have enough to run without asking the user to map columns? */
     public function mappable(array $map): bool
     {
         return isset($map['model']) && (isset($map['input_tokens']) || isset($map['output_tokens']));
@@ -68,61 +57,46 @@ class TokenAudit
         return $v === '' ? 0.0 : (float)$v;
     }
 
-    private function rates(string $model): ?array
+    /** Resolve an export model string to a priced model. Returns ['key'=>id,'r'=>rates] or null. */
+    private function resolve(string $model): ?array
     {
-        $key = strtolower(trim($model));
-        if (isset($this->pricing[$model])) return $this->pricing[$model];
-        foreach ($this->pricing as $id => $p) {
-            if (strtolower($id) === $key) return $p;
-        }
-        foreach ($this->pricing as $id => $p) {
-            if (stripos($key, strtolower($id)) !== false || stripos(strtolower($id), $key) !== false) return $p;
+        if (isset($this->models[$model])) return ['key' => $model, 'r' => $this->models[$model]];
+        foreach ($this->models as $id => $r) {
+            if (stripos($model, $id) !== false || stripos($id, $model) !== false) return ['key' => $id, 'r' => $r];
         }
         return null;
     }
 
-    private function priceTokens(string $model, float $in, float $out, float $cached = 0.0): float
+    private function costOf(array $r, float $in, float $out, float $cached = 0.0): float
     {
-        $r = $this->rates($model);
-        if (!$r) return 0.0;
-        
-        $inRate = ($r['input'] ?? ($r['input_per_mtok'] ?? 0)) / 1000000;
-        $outRate = ($r['output'] ?? ($r['output_per_mtok'] ?? 0)) / 1000000;
-        $cacheRate = ($r['cached_input'] ?? ($r['cache_read_per_mtok'] ?? $inRate)) / 1000000;
-        
-        $nc = max(0, $in - $cached);
-        return ($nc * $inRate) + ($cached * $cacheRate) + ($out * $outRate);
+        $c = ($in / 1e6) * ($r['input'] ?? 0) + ($out / 1e6) * ($r['output'] ?? 0);
+        if ($cached > 0) $c += ($cached / 1e6) * ($r['cached_input'] ?? ($r['input'] ?? 0));
+        return $c;
     }
 
-    /** Aggregate rows by model using a column map. */
     public function aggregate(array $rows, array $map): array
     {
         $hasCacheCol = isset($map['cached_tokens']);
-        $hasCostCol = isset($map['cost']);
+        $hasCostCol  = isset($map['cost']);
         $agg = [];
 
         foreach ($rows as $r) {
             $model = trim((string)($r[$map['model']] ?? ''));
             if ($model === '') continue;
 
-            $in   = isset($map['input_tokens']) ? $this->num($r[$map['input_tokens']] ?? 0) : 0.0;
+            $in   = isset($map['input_tokens'])  ? $this->num($r[$map['input_tokens']]  ?? 0) : 0.0;
             $out  = isset($map['output_tokens']) ? $this->num($r[$map['output_tokens']] ?? 0) : 0.0;
             $cad  = $hasCacheCol ? $this->num($r[$map['cached_tokens']] ?? 0) : 0.0;
-            $cost = $hasCostCol ? $this->num($r[$map['cost']] ?? 0) : null;
+            $cost = $hasCostCol  ? $this->num($r[$map['cost']] ?? 0) : null;
             $cnt  = isset($map['count']) ? $this->num($r[$map['count']] ?? 1) : 1.0;
 
             if (!isset($agg[$model])) {
-                $rates = $this->rates($model);
+                $res = $this->resolve($model);
                 $agg[$model] = [
-                    'input'   => 0,
-                    'output'  => 0,
-                    'cached'  => 0,
-                    'cost'    => 0.0,
-                    'count'   => 0,
+                    'input' => 0, 'output' => 0, 'cached' => 0, 'cost' => 0.0, 'count' => 0,
                     'cost_from_data' => $hasCostCol,
-                    'priced'  => $rates !== null,
-                    'tier'    => $rates['tier'] ?? 'mid',
-                    'provider'=> $rates['provider'] ?? ''
+                    'key' => $res['key'] ?? null,
+                    'rates' => $res['r'] ?? null,
                 ];
             }
             $agg[$model]['input']  += $in;
@@ -133,8 +107,8 @@ class TokenAudit
         }
 
         foreach ($agg as $model => &$a) {
-            if (!$a['cost_from_data']) {
-                $a['cost'] = $this->priceTokens($model, $a['input'], $a['output'], $a['cached']);
+            if (!$a['cost_from_data'] && $a['rates']) {
+                $a['cost'] = $this->costOf($a['rates'], $a['input'], $a['output'], $a['cached']);
             }
         }
         unset($a);
@@ -142,71 +116,73 @@ class TokenAudit
         return ['models' => $agg, 'hasCacheCol' => $hasCacheCol, 'hasCostCol' => $hasCostCol];
     }
 
-    /** Run structured analysis; return report. */
-    public function analyze(array $aggData): array
+    public function analyze(array $agg): array
     {
-        $models = $aggData['models'];
-        $totalSpend = array_sum(array_column($models, 'cost'));
-        $totalIn = array_sum(array_column($models, 'input'));
-        $totalOut = array_sum(array_column($models, 'output'));
-        $totalRows = array_sum(array_column($models, 'count'));
-        $hasCached = array_sum(array_column($models, 'cached')) > 0;
-        
-        $tierSpend = ['frontier' => 0, 'mid' => 0, 'economy' => 0];
+        $models = $agg['models'];
+        $total  = array_sum(array_column($models, 'cost'));
+
+        // Rule A — downshift ceiling, driven by downgrade_map
+        $aTotal = 0.0; $downRows = [];
+        foreach ($models as $model => $m) {
+            if (!$m['key'] || !isset($this->downgrade[$m['key']])) continue;
+            $targetId = $this->downgrade[$m['key']];
+            if (!isset($this->models[$targetId])) continue;
+            $downCost = $this->costOf($this->models[$targetId], $m['input'], $m['output'], $m['cached']);
+            $save = max(0.0, $m['cost'] - $downCost);
+            if ($save > 0) {
+                $aTotal += $save;
+                $downRows[] = ['model' => $model, 'to' => $targetId, 'cost' => $m['cost'], 'save' => $save];
+            }
+        }
+        usort($downRows, fn($x, $y) => $y['save'] <=> $x['save']);
+
+        // Rule B — output cost share (≤100%) and a separate, clearly-named ratio
+        $outCost = 0.0; $totIn = 0.0; $totOut = 0.0;
         foreach ($models as $m) {
-            $t = $m['tier'] ?? 'mid';
-            if (isset($tierSpend[$t])) $tierSpend[$t] += $m['cost'];
+            if ($m['rates']) $outCost += ($m['output'] / 1e6) * ($m['rates']['output'] ?? 0);
+            $totIn  += $m['input'];
+            $totOut += $m['output'];
+        }
+        $outShare = $total > 0 ? $outCost / $total : 0.0;   // 0..1, cannot exceed 1
+        $ioRatio  = $totIn > 0 ? $totOut / $totIn : 0.0;     // may exceed 1 — a ratio, never a "share"
+
+        // Rule C — caching
+        $totCached = array_sum(array_column($models, 'cached'));
+        if ($agg['hasCacheCol']) {
+            $cacheFlag = ($totIn > 0 && $totCached < 0.02 * $totIn);
+            $cacheNote = $cacheFlag
+                ? 'Almost no cached tokens against high input volume — re-sent system prompts are likely paid in full on every call.'
+                : 'Caching is already in use on some traffic.';
+        } else {
+            $cacheFlag = true;
+            $cacheNote = 'No cache data in this export. If you re-send large system prompts, caching is likely an easy win worth checking.';
         }
 
-        $findings = [];
-
-        // Rule A — frontier downshift ceiling
-        $aTotal = 0.0; $aRows = [];
-        foreach ($models as $name => $m) {
-            if (($m['tier'] ?? '') !== 'frontier') continue;
-            $r = $this->rates($name);
-            $down = $r['next_tier_down'] ?? null;
-            // Legacy check or explicit map
-            if (!$down && strpos(strtolower($name), 'gpt-4') !== false) $down = 'gpt-4o-mini';
-            
-            if ($down) {
-                $downCost = $this->priceTokens($down, $m['input'], $m['output'], $m['cached']);
-                $save = max(0.0, $m['cost'] - $downCost);
-                if ($save > 0) {
-                    $aTotal += $save;
-                    $aRows[] = ['model' => $name, 'to' => $down, 'save' => $save, 'cost' => $m['cost']];
-                }
-            }
+        // Rule D — spend concentration
+        $spendRows = [];
+        foreach ($models as $model => $m) {
+            $spendRows[] = ['model' => $model, 'cost' => $m['cost'], 'share' => $total > 0 ? $m['cost'] / $total : 0,
+                            'input' => $m['input'], 'output' => $m['output'], 'priced' => $m['rates'] !== null];
         }
-        usort($aRows, fn($x, $y) => $y['save'] <=> $x['save']);
-        $findings['A'] = ['title' => 'Frontier Downshift Opportunity', 'save' => $aTotal, 'rows' => $aRows];
+        usort($spendRows, fn($x, $y) => $y['cost'] <=> $x['cost']);
 
-        // Rule B — output verbosity
-        $outCostTotal = 0;
-        $bFindings = [];
-        foreach ($models as $name => $m) {
-            $r = $this->rates($name);
-            if (!$r) continue;
-            $oc = ($m['output'] / 1e6) * ($r['output'] ?? ($r['output_per_mtok'] ?? 0));
-            $outCostTotal += $oc;
-            $frac = $m['cost'] > 0 ? $oc / $m['cost'] : 0;
-            if ($frac > 0.55 && $m['cost'] > 0.01) {
-                $bFindings[] = ['model' => $name, 'out_frac' => round($frac * 100, 1), 'cost' => $m['cost']];
-            }
-        }
-        $findings['B'] = ['title' => 'Output-Token Sprawl', 'findings' => $bFindings, 'out_cost_total' => $outCostTotal];
-
-        // Rule C — Caching
-        $findings['C'] = ['title' => 'Prompt Caching Opportunity', 'has_cached' => $hasCached, 'total_in' => $totalIn];
+        $unpriced = [];
+        foreach ($models as $model => $m) { if ($m['rates'] === null) $unpriced[] = $model; }
 
         return [
-            'total_spend'   => $totalSpend,
-            'total_in'      => $totalIn,
-            'total_out'     => $totalOut,
-            'total_rows'    => $totalRows,
-            'spend_by_tier' => $tierSpend,
-            'findings'      => $findings,
-            'model_data'    => $models
+            'total'              => $total,
+            'headline_save'      => $aTotal,
+            'headline_pct'       => $total > 0 ? $aTotal / $total : 0.0,
+            'output_cost'        => $outCost,
+            'output_cost_share'  => $outShare,
+            'output_input_ratio' => $ioRatio,
+            'output_save_per_20' => 0.2 * $outCost,
+            'cache_flag'         => $cacheFlag,
+            'cache_note'         => $cacheNote,
+            'downshift_rows'     => $downRows,
+            'spend_rows'         => $spendRows,
+            'unpriced'           => $unpriced,
+            'batch_note'         => 'Is any of this non-realtime — evals, backfills, bulk jobs? Batch endpoints run roughly half price. Worth confirming.',
         ];
     }
 }
