@@ -116,7 +116,7 @@ $CANON_LABELS = [
 @font-face{font-family:'IBM Plex Mono';src:url('/fonts/IBMPlexMono.woff2') format('woff2');font-weight:400 600;font-display:swap}
 :root{
   --ink:#0F1218; --panel:#181D26; --line:#262D39;
-  --text:#E8EBF0; --muted:#8B95A6; --signal:#F5A524;
+  --text:#E8EBF0; --muted:#8B95A6; --signal:lime;/*#F5A524;*/
   --risk:#D9544B; --safe:#57B86B;
   --display:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;
   --body:'Hanken Grotesk',ui-sans-serif,system-ui,sans-serif;
