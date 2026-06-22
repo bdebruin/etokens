@@ -1,477 +1,269 @@
 <?php
-/** etokens.com - Token-Cost Audit MVP */
-session_start();
+/**
+ * index.php — etokens token-cost audit (clean, stateless).
+ * No sessions. No stored files. Each request is self-contained: parse -> (map?) -> analyze -> render.
+ * The CSV rides through the column-mapping step in a hidden field (in memory), never touching disk.
+ */
+require __DIR__ . '/engine.php';
 
-if (isset($_GET['reset'])) {
-    session_unset();
-    session_destroy();
-    header('Location: ' . strtok($_SERVER['REQUEST_URI'], '?'));
-    exit;
-}
+const MAX_BYTES = 10 * 1024 * 1024; // 10 MB
+$audit = new TokenAudit(__DIR__ . '/pricing.json');
 
-require_once __DIR__ . '/engine.php';
-
-function e(string $s): string {
-    return htmlspecialchars($s, ENT_QUOTES|ENT_HTML5, "UTF-8");
-}
-
-function fmt($n): string {
-    if ($n >= 1000000) return round($n/1000000, 2)."M";
-    if ($n >= 1000) return round($n/1000, 1)."K";
-    return (string)round($n, 0);
-}
-
-function dollar(float $v): string {
-    return $v >= 1 ? "$".number_format(round($v,2),2) : "$".number_format(round($v,4),4);
-}
-
-$PRICING_FILE = __DIR__ . "/pricing.json";
-$auditEngine = new TokenAudit($PRICING_FILE);
-
-$step   = $_SESSION["step"]    ?? "upload";
-$err    = $_SESSION["error"]   ?? "";
-$rows   = $_SESSION["rows"]    ?? [];
-$hdrs   = $_SESSION["headers"] ?? [];
-$map    = $_SESSION["map"]     ?? [];
-$schema = $_SESSION["schema"]  ?? null;
-$report = null;
-$_SESSION["error"] = "";
-
-function parse_csv(string $content): array {
-    $lines = preg_split("/\r\n|\n|\r/", trim($content));
-    if (count($lines) < 2) return ["headers"=>[], "rows"=>[]];
-    $headers = array_map("trim", str_getcsv(array_shift($lines)));
+function parse_csv(string $csv): array
+{
+    $fh = fopen('php://temp', 'r+');
+    fwrite($fh, $csv);
+    rewind($fh);
+    $header = fgetcsv($fh) ?: [];
     $rows = [];
-    foreach ($lines as $line) {
-        $line = trim($line);
-        if ($line === "") continue;
-        $row = str_getcsv($line);
-        if (count($row) >= count($headers)) {
-            $rows[] = array_map("trim", array_slice($row, 0, count($headers)));
-        }
+    while (($r = fgetcsv($fh)) !== false) {
+        if (count($r) === 1 && trim((string)$r[0]) === '') continue;
+        $rows[] = $r;
     }
-    return ["headers"=>$headers, "rows"=>$rows];
+    fclose($fh);
+    return [$header, $rows];
 }
 
-if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST["action"])) {
-    $action = $_POST["action"];
+$state = 'upload';      // upload | map | report | error
+$error = '';
+$report = null;
+$header = [];
+$csvRaw = '';
+$detected = [];
 
-    if ($action === "upload") {
-        unset($_SESSION["rows"], $_SESSION["headers"], $_SESSION["map"], $_SESSION["schema"], $_SESSION["report"]);
-        if (empty($_FILES["csv"]) || $_FILES["csv"]["error"] !== UPLOAD_ERR_OK) {
-            $_SESSION["error"] = "Upload failed. Please try again.";
-        } elseif ($_FILES["csv"]["size"] > 10 * 1024 * 1024) {
-            $_SESSION["error"] = "File too large. Maximum size is 10 MB.";
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    if (!empty($_FILES['csv']['tmp_name']) && is_uploaded_file($_FILES['csv']['tmp_name'])) {
+        if (($_FILES['csv']['size'] ?? 0) > MAX_BYTES) {
+            $state = 'error'; $error = 'That file is over 10 MB. Trim it to a single month and try again.';
+        } elseif (strtolower(pathinfo($_FILES['csv']['name'], PATHINFO_EXTENSION)) !== 'csv') {
+            $state = 'error'; $error = 'Upload a .csv usage export.';
         } else {
-            $ext = strtolower(pathinfo($_FILES["csv"]["name"], PATHINFO_EXTENSION));
-            if ($ext !== "csv") {
-                $_SESSION["error"] = "Only .csv files are accepted.";
+            $csvRaw = file_get_contents($_FILES['csv']['tmp_name']);
+        }
+    } elseif (!empty($_POST['carry'])) {
+        $csvRaw = base64_decode($_POST['carry'], true) ?: '';
+        if (strlen($csvRaw) > MAX_BYTES) { $state = 'error'; $error = 'That file is too large to process.'; $csvRaw = ''; }
+    }
+
+    if ($csvRaw !== '' && $state !== 'error') {
+        [$header, $rows] = parse_csv($csvRaw);
+
+        if (!empty($_POST['map']) && is_array($_POST['map'])) {
+            $map = [];
+            foreach ($_POST['map'] as $canon => $idx) {
+                if ($idx !== '' && is_numeric($idx)) $map[$canon] = (int)$idx;
+            }
+        } else {
+            $map = $audit->detectColumns($header);
+        }
+
+        if (!$audit->mappable($map)) {
+            $state = 'map';
+            $detected = $map;
+        } else {
+            $agg = $audit->aggregate($rows, $map);
+            if (empty($agg['models'])) {
+                $state = 'error'; $error = 'No usable rows found. Check that a model column and token columns are present.';
             } else {
-                $content = file_get_contents($_FILES["csv"]["tmp_name"]);
-                $parsed  = parse_csv($content);
-                @unlink($_FILES["csv"]["tmp_name"]);
-                if (empty($parsed["rows"])) {
-                    $_SESSION["error"] = "CSV appears empty or could not be parsed.";
-                } else {
-                    $_SESSION["headers"] = $parsed["headers"];
-                    $_SESSION["rows"]    = $parsed["rows"];
-                    
-                    $detectedMap = $auditEngine->detectColumns($parsed["headers"]);
-                    $_SESSION["map"] = $detectedMap;
-                    
-                    if ($auditEngine->mappable($detectedMap)) {
-                        $_SESSION["step"] = "audit";
-                    } else {
-                        $_SESSION["step"] = "remap";
-                    }
-                }
+                $report = $audit->analyze($agg);
+                $state = 'report';
             }
         }
-        header("Location: " . $_SERVER["REQUEST_URI"]);
-        exit;
-
-    } elseif ($action === "remap") {
-        $userMap = [];
-        foreach (['model', 'input_tokens', 'output_tokens', 'cached_tokens', 'cost', 'count', 'date', 'label'] as $canon) {
-            $val = trim($_POST["col_" . $canon] ?? "");
-            if ($val !== "") {
-                // Find index of this header
-                $idx = array_search($val, $_SESSION["headers"], true);
-                if ($idx !== false) {
-                    $userMap[$canon] = $idx;
-                }
-            }
-        }
-        $_SESSION["map"] = $userMap;
-        if (!isset($userMap['model']) || (!isset($userMap['input_tokens']) && !isset($userMap['output_tokens']))) {
-            $_SESSION["error"] = "Model and either Input or Output token columns are required.";
-            $_SESSION["step"] = "remap";
-        } else {
-            $_SESSION["step"] = "audit";
-        }
-        header("Location: " . $_SERVER["REQUEST_URI"]);
-        exit;
-
-    } elseif ($action === "reset") {
-        session_destroy();
-        header("Location: " . strtok($_SERVER["REQUEST_URI"], "?"));
-        exit;
+    } elseif ($state !== 'error') {
+        $state = 'error'; $error = 'No file received. Choose a .csv export and run the audit.';
     }
 }
 
-if ($step === "audit" && !empty($rows) && !empty($map)) {
-    $agg = $auditEngine->aggregate($rows, $map);
-    $report = $auditEngine->analyze($agg);
-    $_SESSION["report"] = $report;
-    $_SESSION["step"] = "report";
-    $step = "report";
-}
-if ($step === "report" && !$report) {
-    $report = $_SESSION["report"] ?? null;
-}
-
-?>
-<!DOCTYPE html>
+function h($s): string { return htmlspecialchars((string)$s, ENT_QUOTES, 'UTF-8'); }
+function usd($n): string { return '$' . number_format((float)$n, 2); }
+function ntok($n): string { return number_format((float)$n); }
+$CANON_LABELS = [
+    'model' => 'Model', 'input_tokens' => 'Input tokens', 'output_tokens' => 'Output tokens',
+    'cached_tokens' => 'Cached tokens', 'cost' => 'Cost', 'count' => 'Requests',
+];
+?><!doctype html>
 <html lang="en">
 <head>
-<meta charset="UTF-8">
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>etokens — LLM Token-Cost Audit</title>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>etokens — token-cost audit</title>
 <style>
-:root{--bg:#0d1117;--panel:#161b22;--panel2:#21262d;--border:#30363d;--accent:#f0b429;--accent2:#e0549d;--teal:#39d0a3;--red:#f85149;--text:#e6edf3;--muted:#8b949e;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif;--mono:'SF Mono','Fira Code',monospace;}
-*{box-sizing:border-box;margin:0;padding:0}
-body{background:var(--bg);color:var(--text);font:15px/1.6 var(--font);min-height:100vh}
-a{color:var(--teal);text-decoration:none}a:hover{text-decoration:underline}
-header{border-bottom:1px solid var(--border);padding:16px 24px;display:flex;align-items:center;gap:12px}
-.logo{font-size:22px;font-weight:700;letter-spacing:-0.5px}.logo span{color:var(--accent)}
-.tagline{color:var(--muted);font-size:13px;border-left:1px solid var(--border);padding-left:12px}
-header a{color:var(--text)}header a:hover{text-decoration:none}
-main{max-width:860px;margin:0 auto;padding:40px 24px 80px}
-.upload-zone{display:flex;flex-direction:column;align-items:center;justify-content:center;width:100%;border:2px dashed var(--border);border-radius:12px;padding:64px 32px;text-align:center;cursor:pointer;transition:border-color .2s,background .2s;background:var(--panel)}
-.upload-zone:hover,.upload-zone.dragover{border-color:var(--accent);background:#1c2128}
-.upload-zone input{display:none}
-.upload-icon{font-size:48px;margin-bottom:16px}
-.upload-zone h2{font-size:20px;margin-bottom:8px}
-.upload-zone p{color:var(--muted);font-size:13px}
-.btn{display:inline-flex;align-items:center;gap:6px;padding:10px 20px;border-radius:8px;font-size:14px;font-weight:600;cursor:pointer;border:none;transition:opacity .2s}
-.btn:hover{opacity:0.85}
-.btn-primary{background:var(--accent);color:#000}
-.btn-ghost{background:var(--panel2);color:var(--text);border:1px solid var(--border)}
-.error-msg{background:#3d1a1a;border:1px solid var(--red);border-radius:8px;padding:12px 16px;color:var(--red);margin-bottom:16px;font-size:14px}
-.supported{margin-top:24px;display:flex;gap:16px;justify-content:center;flex-wrap:wrap}
-.supported span{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:4px 12px;font-size:12px;color:var(--muted);font-family:var(--mono)}
-.remap-box{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:32px}
-.remap-box h2{font-size:18px;margin-bottom:4px}
-.remap-box p{color:var(--muted);font-size:13px;margin-bottom:24px}
-.col-map{display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:24px}
-.field{display:flex;flex-direction:column;gap:6px}
-.field label{font-size:12px;font-weight:600;color:var(--muted);text-transform:uppercase;letter-spacing:.5px}
-.field label .req{color:var(--red)}
-.field select,.field input{background:var(--panel2);border:1px solid var(--border);border-radius:6px;color:var(--text);padding:8px 12px;font-size:14px}
-.field select{cursor:pointer}
-.field small{font-size:11px;color:var(--muted)}
-.remap-actions{display:flex;gap:12px}
-.report-header{margin-bottom:32px}
-.report-header h1{font-size:26px;margin-bottom:4px}
-.report-header p{color:var(--muted);font-size:13px}
-.report-meta{display:flex;gap:24px;margin-top:12px;flex-wrap:wrap}
-.meta-pill{background:var(--panel);border:1px solid var(--border);border-radius:100px;padding:4px 12px;font-size:12px;color:var(--muted)}
-.meta-pill strong{color:var(--text)}
-.summary-cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(180px,1fr));gap:12px;margin-bottom:32px}
-.card{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px}
-.card-label{font-size:11px;font-weight:600;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);margin-bottom:8px}
-.card-value{font-size:28px;font-weight:700;font-family:var(--mono)}
-.card-sub{font-size:12px;color:var(--muted);margin-top:4px}
-.card.accent{border-color:var(--accent)}.card.accent .card-value{color:var(--accent)}
-.card.pink{border-color:var(--accent2)}.card.pink .card-value{color:var(--accent2)}
-.card.teal{border-color:var(--teal)}.card.teal .card-value{color:var(--teal)}
-.tier-bar-wrap{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;margin-bottom:32px}
-.tier-bar-title{font-size:13px;font-weight:600;margin-bottom:12px}
-.tier-bar{height:12px;border-radius:6px;display:flex;overflow:hidden;background:var(--panel2)}
-.tier-seg{transition:width .4s}
-.tier-legend{display:flex;gap:16px;margin-top:10px;flex-wrap:wrap}
-.tier-legend span{font-size:11px;color:var(--muted)}.tier-legend strong{color:var(--text)}
-.findings{display:flex;flex-direction:column;gap:16px;margin-bottom:32px}
-.finding{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px}
-.finding.rule-a{border-left:3px solid var(--accent)}
-.finding.rule-b{border-left:3px solid var(--accent2)}
-.finding.rule-c{border-left:3px solid var(--teal)}
-.finding.rule-d{border-left:3px solid #9d7af5}
-.finding.rule-e{border-left:3px solid var(--muted)}
-.finding-head{display:flex;align-items:center;gap:10px;margin-bottom:8px;flex-wrap:wrap}
-.finding-badge{font-size:10px;font-weight:700;letter-spacing:.5px;padding:3px 8px;border-radius:4px;text-transform:uppercase}
-.badge-a{background:rgba(240,180,41,.15);color:var(--accent)}
-.badge-b{background:rgba(224,84,157,.15);color:var(--accent2)}
-.badge-c{background:rgba(57,208,163,.15);color:var(--teal)}
-.badge-d{background:rgba(157,122,245,.15);color:#9d7af5}
-.badge-e{background:rgba(139,148,158,.15);color:var(--muted)}
-.finding h3{font-size:15px;font-weight:600}
-.finding p{color:var(--muted);font-size:13px;margin-bottom:12px;line-height:1.5}
-.finding table{width:100%;border-collapse:collapse;font-size:13px}
-.finding th{text-align:left;padding:6px 10px;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;border-bottom:1px solid var(--border)}
-.finding td{padding:8px 10px;border-bottom:1px solid #21262d;font-family:var(--mono);font-size:12px}
-.finding tr:last-child td{border-bottom:none}
-.finding .saving{color:var(--teal);font-weight:600}
-.effort{display:inline-block;font-size:10px;padding:2px 7px;border-radius:4px;text-transform:uppercase;font-weight:700;letter-spacing:.5px}
-.eff-l{background:rgba(57,208,163,.15);color:var(--teal)}
-.eff-m{background:rgba(240,180,41,.15);color:var(--accent)}
-.eff-h{background:rgba(248,81,73,.15);color:var(--red)}
-.finding-footer{display:flex;gap:16px;align-items:center;margin-top:12px;flex-wrap:wrap}
-.sensitivity{background:var(--panel2);border-radius:6px;padding:8px 12px;font-size:12px;color:var(--muted)}
-.sensitivity strong{color:var(--teal)}
-.models-table{background:var(--panel);border:1px solid var(--border);border-radius:10px;overflow:hidden;margin-bottom:32px}
-.models-table h2{font-size:15px;padding:16px 20px;border-bottom:1px solid var(--border)}
-.models-table table{width:100%;border-collapse:collapse}
-.models-table th{text-align:left;padding:10px 16px;font-size:11px;text-transform:uppercase;letter-spacing:.5px;color:var(--muted);background:var(--panel2);border-bottom:1px solid var(--border)}
-.models-table td{padding:10px 16px;font-size:13px;border-bottom:1px solid var(--border);font-family:var(--mono)}
-.models-table tr:last-child td{border-bottom:none}
-.models-table tr:hover td{background:var(--panel2)}
-.tier-badge{font-size:10px;padding:2px 7px;border-radius:4px;text-transform:uppercase;font-weight:700;letter-spacing:.5px}
-.tier-f{background:rgba(240,180,41,.15);color:var(--accent)}
-.tier-m{background:rgba(57,208,163,.15);color:var(--teal)}
-.tier-e{background:rgba(139,148,158,.15);color:var(--muted)}
-.disclaimer{background:var(--panel);border:1px solid var(--border);border-radius:10px;padding:20px;font-size:12px;color:var(--muted);line-height:1.6;margin-bottom:32px}
-.disclaimer strong{color:var(--text)}
-.reset-link{display:inline-block;margin-top:24px;font-size:13px;color:var(--muted)}
-.reset-link:hover{color:var(--red)}
-@media(max-width:600px){.col-map{grid-template-columns:1fr}.summary-cards{grid-template-columns:1fr 1fr}}
-@media print{body{background:#fff;color:#000}.finding,.card,.remap-box,.upload-zone,.models-table,.tier-bar-wrap,.disclaimer{border-color:#ccc;background:#fff}header{border-color:#ccc}.btn{display:none}}
+@font-face{font-family:'Space Grotesk';src:url('/fonts/SpaceGrotesk.woff2') format('woff2');font-weight:400 700;font-display:swap}
+@font-face{font-family:'Hanken Grotesk';src:url('/fonts/HankenGrotesk.woff2') format('woff2');font-weight:400 600;font-display:swap}
+@font-face{font-family:'IBM Plex Mono';src:url('/fonts/IBMPlexMono.woff2') format('woff2');font-weight:400 600;font-display:swap}
+:root{
+  --ink:#0F1218; --panel:#181D26; --line:#262D39;
+  --text:#E8EBF0; --muted:#8B95A6; --signal:#F5A524;
+  --risk:#D9544B; --safe:#57B86B;
+  --display:'Space Grotesk',ui-sans-serif,system-ui,sans-serif;
+  --body:'Hanken Grotesk',ui-sans-serif,system-ui,sans-serif;
+  --mono:'IBM Plex Mono',ui-monospace,'SFMono-Regular',Menlo,monospace;
+}
+*{box-sizing:border-box}
+body{margin:0;background:var(--ink);color:var(--text);font-family:var(--body);font-size:16px;line-height:1.5;-webkit-font-smoothing:antialiased}
+.wrap{max-width:880px;margin:0 auto;padding:48px 20px 96px}
+.mono{font-family:var(--mono);font-variant-numeric:tabular-nums}
+h1{font-family:var(--display);font-weight:700;font-size:30px;letter-spacing:-.01em;margin:0 0 4px}
+.eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.14em;text-transform:uppercase;color:var(--muted);margin:0 0 24px}
+.sub{color:var(--muted);margin:0 0 32px;max-width:60ch}
+a{color:var(--signal)}
+.card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:24px;margin:18px 0}
+label.file{display:block;border:1px dashed var(--line);border-radius:12px;padding:40px 24px;text-align:center;background:var(--panel);cursor:pointer;transition:border-color .15s}
+label.file:hover{border-color:var(--signal)}
+input[type=file]{display:block;margin:14px auto 0;color:var(--muted)}
+.btn{font-family:var(--display);font-weight:600;font-size:15px;background:var(--signal);color:#1a1206;border:0;border-radius:10px;padding:12px 22px;cursor:pointer;margin-top:18px}
+.btn:focus-visible,label.file:focus-within,select:focus-visible{outline:2px solid var(--signal);outline-offset:2px}
+.note{color:var(--muted);font-size:13px;margin-top:14px}
+.meter{margin:6px 0 2px}
+.meter .big{font-family:var(--mono);font-variant-numeric:tabular-nums;font-weight:600;font-size:64px;line-height:1;color:var(--signal);letter-spacing:-.02em}
+.meter .unit{font-family:var(--mono);color:var(--muted);font-size:18px;margin-left:6px}
+.meter .pct{font-family:var(--mono);color:var(--muted);font-size:14px;margin-top:8px}
+.caveat{color:var(--muted);font-size:13px;margin-top:10px;border-left:2px solid var(--line);padding-left:12px}
+table{width:100%;border-collapse:collapse;font-size:14px}
+th,td{text-align:left;padding:9px 8px;border-bottom:1px solid var(--line)}
+th{font-family:var(--mono);font-size:11px;letter-spacing:.08em;text-transform:uppercase;color:var(--muted);font-weight:400}
+td.num,th.num{text-align:right;font-family:var(--mono);font-variant-numeric:tabular-nums}
+.finding{margin:14px 0;padding:18px;border:1px solid var(--line);border-radius:10px}
+.finding h3{font-family:var(--display);font-size:17px;margin:0 0 6px;display:flex;justify-content:space-between;gap:12px;align-items:baseline}
+.drain{font-family:var(--mono);color:var(--signal);font-variant-numeric:tabular-nums}
+.tags{display:flex;gap:8px;margin:8px 0 0;flex-wrap:wrap}
+.tag{font-family:var(--mono);font-size:11px;letter-spacing:.06em;padding:2px 8px;border-radius:5px;border:1px solid var(--line);color:var(--muted)}
+.tag.risk{color:var(--risk);border-color:var(--risk)}
+.tag.safe{color:var(--safe);border-color:var(--safe)}
+.tag.eval{color:var(--signal);border-color:var(--signal)}
+.bar{height:6px;background:var(--line);border-radius:3px;overflow:hidden;margin-top:8px}
+.bar>span{display:block;height:100%;background:var(--signal)}
+.foot{color:var(--muted);font-size:13px;margin-top:36px;font-family:var(--mono)}
+.map-row{display:flex;gap:12px;align-items:center;margin:10px 0}
+.map-row .lbl{width:140px;color:var(--muted);font-size:14px}
+select{background:var(--ink);color:var(--text);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font-family:var(--mono);font-size:13px;flex:1}
+.errbox{border-left:2px solid var(--risk);padding-left:14px}
+@media (prefers-reduced-motion:no-preference){.meter .big{animation:rise .5s ease-out both}}
+@keyframes rise{from{opacity:0;transform:translateY(6px)}to{opacity:1;transform:none}}
 </style>
 </head>
 <body>
-<header>
-  <a href="?" class="logo">etokens<span>.com</span></a>
-  <span class="tagline">LLM token-cost audit — no login, no account, no API keys</span>
-</header>
-<main>
-<?php if ($step === "upload"): ?>
-<?php if ($err): ?>
-  <div class="error-msg"><?= e($err) ?></div>
-<?php endif; ?>
-<form action="" method="POST" enctype="multipart/form-data" id="uploadForm">
-  <input type="hidden" name="action" value="upload">
-  <div class="upload-zone" id="dropZone">
-    <input type="file" name="csv" id="csvInput" accept=".csv">
-    <div class="upload-icon">&#128202;</div>
-    <h2>Drop your CSV usage export here</h2>
-    <p>or click to browse &mdash; max 10 MB, .csv only</p>
-  </div>
-  <div class="supported" style="margin-top:12px;margin-bottom:12px;justify-content:center;display:flex;">
-    <a href="/sample.csv" style="color:var(--accent);font-weight:bold;text-decoration:underline;">Download Sample CSV File</a>
-  </div>
-  <div class="supported">
-    <span>gpt-4o</span><span>claude-opus-4</span><span>gemini-2.5-pro</span>
-    <span>deepseek-chat</span><span>mistral-large</span><span>llama-3.1-405b</span>
-  </div>
-  <div style="text-align:center;margin-top:24px">
-    <button type="submit" class="btn btn-primary" id="uploadBtn" disabled>Upload &amp; Analyze</button>
-  </div>
-</form>
-<script>
-const zi = document.getElementById("dropZone"), zi2 = document.getElementById("csvInput"), zi3 = document.getElementById("uploadBtn");
-zi.addEventListener("click", () => zi2.click());
-zi2.addEventListener("change", () => { if(zi2.files[0]) { zi3.disabled = false; document.querySelector(".upload-zone p").textContent = "Selected: " + zi2.files[0].name; } });
-zi.addEventListener("dragover", e => { e.preventDefault(); zi.classList.add("dragover"); });
-zi.addEventListener("dragleave", () => zi.classList.remove("dragover"));
-zi.addEventListener("drop", e => { e.preventDefault(); zi.classList.remove("dragover"); if(e.dataTransfer.files[0]) { zi2.files = e.dataTransfer.files; zi3.disabled = false; document.querySelector(".upload-zone p").textContent = "Selected: " + e.dataTransfer.files[0].name; } });
-</script>
-<?php elseif ($step === "remap"): ?>
-<?php
-  // Pre-compute dropdown options
-  $opt_model  = ""; foreach($hdrs as $h) $opt_model  .= "<option value=\"".e($h)."\"" . (isset($map["model"]) && $map["model"]===$h?" selected":"").">".e($h)."</option>";
-  $opt_input  = ""; foreach($hdrs as $h) $opt_input  .= "<option value=\"".e($h)."\"" . (isset($map["input_tokens"]) && $map["input_tokens"]===$h?" selected":"").">".e($h)."</option>";
-  $opt_output = ""; foreach($hdrs as $h) $opt_output .= "<option value=\"".e($h)."\"" . (isset($map["output_tokens"]) && $map["output_tokens"]===$h?" selected":"").">".e($h)."</option>";
-  $opt_cost   = ""; foreach($hdrs as $h) $opt_cost   .= "<option value=\"".e($h)."\"" . (isset($map["cost"]) && $map["cost"]===$h?" selected":"").">".e($h)."</option>";
-  $opt_cached = ""; foreach($hdrs as $h) $opt_cached .= "<option value=\"".e($h)."\"" . (isset($map["cached_tokens"]) && $map["cached_tokens"]===$h?" selected":"").">".e($h)."</option>";
-?>
-<div class="remap-box">
-  <h2>Map your columns</h2>
-  <p>We couldn't auto-detect your export format. Please match each required field to the right column.</p>
-  <form action="" method="POST">
-    <input type="hidden" name="action" value="remap">
-    <div class="col-map">
-      <div class="field">
-        <label>Model <span class="req">*</span></label>
-        <select name="col_model" required><option value="">— select —</option><?= $opt_model ?></select>
-        <small>e.g. model, model_name</small>
-      </div>
-      <div class="field">
-        <label>Input Tokens <span class="req">*</span></label>
-        <select name="col_input_tokens" required><option value="">— select —</option><?= $opt_input ?></select>
-        <small>prompt_tokens, input_tokens, etc.</small>
-      </div>
-      <div class="field">
-        <label>Output Tokens <span class="req">*</span></label>
-        <select name="col_output_tokens" required><option value="">— select —</option><?= $opt_output ?></select>
-        <small>completion_tokens, output_tokens, etc.</small>
-      </div>
-      <div class="field">
-        <label>Cost <small>(optional)</small></label>
-        <select name="col_cost"><option value="">— none —</option><?= $opt_cost ?></select>
-        <small>Total cost column (if pre-computed)</small>
-      </div>
-      <div class="field">
-        <label>Cached Tokens <small>(optional)</small></label>
-        <select name="col_cached_tokens"><option value="">— none —</option><?= $opt_cached ?></select>
-        <small>cache_creation_input_tokens, cached_prompt_tokens</small>
-      </div>
-    </div>
-    <div class="remap-actions">
-      <button type="submit" class="btn btn-primary">Run Audit</button>
-      <a href="?reset=1" class="btn btn-ghost">Start Over</a>
-    </div>
+<div class="wrap">
+  <p class="eyebrow">etokens · token-cost audit</p>
+
+<?php if ($state === 'upload' || $state === 'error'): ?>
+  <h1>Find the money in your token bill.</h1>
+  <p class="sub">Drop in a usage export from OpenAI, Anthropic, or OpenRouter. You get a spend map, a ranked list of where it leaks, and a recoverable-spend estimate. Processed in memory — nothing stored.</p>
+  <?php if ($state === 'error'): ?>
+    <div class="card"><div class="errbox"><strong>Couldn't run that.</strong><br><?= h($error) ?></div></div>
+  <?php endif; ?>
+  <form method="post" enctype="multipart/form-data">
+    <label class="file">
+      <strong>Choose a .csv usage export</strong>
+      <input type="file" name="csv" accept=".csv" required>
+      <div class="note">Aggregated or per-request. We auto-detect the format; if it's unfamiliar, you'll map the columns yourself.</div>
+    </label>
+    <button class="btn" type="submit">Run the audit</button>
   </form>
-</div>
-<?php elseif ($step === "report" && $report): ?>
-<?php
-  $ts  = $report["total_spend"];
-  $tin = $report["total_in"];
-  $tout= $report["total_out"];
-  $tr  = $report["total_rows"];
-  $st  = $report["spend_by_tier"];
-  $md  = $report["model_data"];
-  $findings = $report["findings"];
-  
-  $total_t = max(0.001, $st["frontier"] + $st["mid"] + $st["economy"]);
-  $wf = round($st["frontier"] / $total_t * 100, 1);
-  $wm = round($st["mid"]      / $total_t * 100, 1);
-  $we = round($st["economy"]  / $total_t * 100, 1);
-?>
-<div class="report-header">
-  <h1>Token-Cost Audit Report</h1>
-  <p>Parsed <?= number_format($tr) ?> rows</p>
-  <div class="report-meta">
-    <span class="meta-pill"><strong><?= dollar($ts) ?></strong> total spend</span>
-    <span class="meta-pill"><strong><?= fmt($tin) ?></strong> input tokens</span>
-    <span class="meta-pill"><strong><?= fmt($tout) ?></strong> output tokens</span>
-  </div>
-</div>
 
-<div class="summary-cards">
-  <div class="card accent">
-    <div class="card-label">Total Spend</div>
-    <div class="card-value"><?= dollar($ts) ?></div>
-    <div class="card-sub"><?= number_format($tr) ?> API calls</div>
-  </div>
-  <div class="card pink">
-    <div class="card-label">Output Cost Share</div>
-    <div class="card-value"><?= round(($ts > 0 && isset($findings['B']['out_cost_total'])) ? ($findings['B']['out_cost_total'] / $ts * 100) : 0, 1) ?>%</div>
-    <div class="card-sub">of total spend on output</div>
-  </div>
-  <div class="card teal">
-    <div class="card-label">Savings Ceiling (A)</div>
-    <div class="card-value"><?= dollar($findings['A']['save'] ?? 0) ?></div>
-    <div class="card-sub">frontier downshift potential</div>
-  </div>
-</div>
-
-<div class="tier-bar-wrap">
-  <div class="tier-bar-title">Spend by Tier</div>
-  <div class="tier-bar">
-    <div class="tier-seg" style="width:<?= $wf ?>%;background:#f0b429" title="Frontier: <?= $wf ?>%"></div>
-    <div class="tier-seg" style="width:<?= $wm ?>%;background:#39d0a3" title="Mid: <?= $wm ?>%"></div>
-    <div class="tier-seg" style="width:<?= $we ?>%;background:#8b949e" title="Economy: <?= $we ?>%"></div>
-  </div>
-  <div class="tier-legend">
-    <span><strong style="color:#f0b429">&#9632;</strong> Frontier: <?= dollar($st["frontier"]) ?></span>
-    <span><strong style="color:#39d0a3">&#9632;</strong> Mid: <?= dollar($st["mid"]) ?></span>
-    <span><strong style="color:#8b949e">&#9632;</strong> Economy: <?= dollar($st["economy"]) ?></span>
-  </div>
-</div>
-
-<div class="models-table">
-  <h2>Models</h2>
-  <table>
-    <thead>
-      <tr><th>Model</th><th>Provider</th><th>Tier</th><th>Input</th><th>Output</th><th>Est. Cost</th></tr>
-    </thead>
-    <tbody>
-<?php
-$sorted = $md;
-uasort($sorted, fn($a,$b) => $b["cost"] <=> $a["cost"]);
-foreach ($sorted as $m => $d):
-?>
-      <tr>
-        <td><?= e($m) ?></td>
-        <td><?= e($d["provider"]) ?></td>
-        <td><span class="tier-badge tier-<?= substr($d["tier"],0,1) ?>"><?= e($d["tier"]) ?></span></td>
-        <td><?= fmt($d["input"]) ?></td>
-        <td><?= fmt($d["output"]) ?></td>
-        <td><?= dollar($d["cost"]) ?></td>
-      </tr>
-<?php endforeach; ?>
-    </tbody>
-  </table>
-</div>
-
-<div class="findings">
-<?php if (isset($findings['A']) && !empty($findings['A']['rows'])): ?>
-  <div class="finding rule-a">
-    <div class="finding-head">
-      <span class="finding-badge badge-a">Rule A</span>
-      <h3><?= e($findings['A']['title']) ?></h3>
-      <span class="effort eff-h">High Effort</span>
-      <span class="effort eff-m">Quality Risk</span>
+<?php elseif ($state === 'map'): ?>
+  <h1>Map your columns.</h1>
+  <p class="sub">We couldn't recognize this export's headers. Point each field at the right column and run it.</p>
+  <form method="post">
+    <input type="hidden" name="carry" value="<?= h(base64_encode($csvRaw)) ?>">
+    <div class="card">
+      <?php foreach (['model','input_tokens','output_tokens','cached_tokens','cost','count'] as $canon): ?>
+        <div class="map-row">
+          <span class="lbl"><?= h($CANON_LABELS[$canon]) ?><?= $canon==='model' ? ' *' : '' ?></span>
+          <select name="map[<?= $canon ?>]">
+            <option value="">— none —</option>
+            <?php foreach ($header as $i => $col): ?>
+              <option value="<?= $i ?>" <?= (isset($detected[$canon]) && $detected[$canon]===$i) ? 'selected':'' ?>><?= h($col) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+      <?php endforeach; ?>
+      <div class="note">Map <em>model</em> and at least one of input / output tokens. Cost is optional — we compute it from the rate card if it's missing.</div>
     </div>
-    <p>You spent money on frontier-tier models. Switching to the next tier down could reduce that by up to <strong class="saving"><?= dollar($findings['A']['save']) ?></strong>.</p>
+    <button class="btn" type="submit">Run the audit</button>
+  </form>
+
+<?php elseif ($state === 'report' && $report): ?>
+  <?php
+    $ocs   = max(0.0, min(1.0, (float)$report['output_cost_share'])) * 100; // true share, clamped 0–100
+    $ratio = (float)$report['output_input_ratio'];
+  ?>
+  <h1>Audit report.</h1>
+  <div class="card">
+    <div class="meter">
+      <span class="big mono"><?= usd($report['headline_save']) ?></span><span class="unit">/period recoverable</span>
+      <div class="pct"><?= number_format($report['headline_pct']*100,1) ?>% of <?= usd($report['total']) ?> analyzed spend · model-downshift ceiling</div>
+    </div>
+    <div class="caveat">This is the ceiling, not a guarantee. Realizing it means moving tolerant traffic to a cheaper model — gate every downgrade behind a 50–500 case eval so quality doesn't silently regress.</div>
+  </div>
+
+  <div class="card">
+    <h3 style="font-family:var(--display);margin:0 0 12px">Where the bill concentrates</h3>
     <table>
-      <tr><th>From Model</th><th>To Model</th><th>Est. Saving</th><th>Original Cost</th></tr>
-<?php foreach ($findings['A']['rows'] as $row): ?>
-      <tr>
-        <td><?= e($row['model']) ?></td>
-        <td><?= e($row['to']) ?></td>
-        <td><span class="saving"><?= dollar($row['save']) ?></span></td>
-        <td><?= dollar($row['cost']) ?></td>
-      </tr>
-<?php endforeach; ?>
+      <thead><tr><th>Model</th><th class="num">Input</th><th class="num">Output</th><th class="num">Cost</th><th class="num">Share</th></tr></thead>
+      <tbody>
+      <?php foreach ($report['spend_rows'] as $r): ?>
+        <tr>
+          <td class="mono"><?= h($r['model']) ?><?= $r['priced'] ? '' : ' <span class="tag">unpriced</span>' ?></td>
+          <td class="num"><?= ntok($r['input']) ?></td>
+          <td class="num"><?= ntok($r['output']) ?></td>
+          <td class="num"><?= usd($r['cost']) ?></td>
+          <td class="num"><?= number_format($r['share']*100,1) ?>%</td>
+        </tr>
+      <?php endforeach; ?>
+      </tbody>
     </table>
   </div>
-<?php endif; ?>
 
-<?php if (isset($findings['B']) && !empty($findings['B']['findings'])): ?>
-  <div class="finding rule-b">
-    <div class="finding-head">
-      <span class="finding-badge badge-b">Rule B</span>
-      <h3><?= e($findings['B']['title']) ?></h3>
-      <span class="effort eff-l">Low Effort</span>
-      <span class="effort eff-m">Low Risk</span>
-    </div>
-    <p>Models below have output costs driving &gt;55% of their line-item cost, a sign of verbose responses or missing <code>max_tokens</code> discipline.</p>
-    <table>
-      <tr><th>Model</th><th>Output Cost Share</th><th>Total Cost</th></tr>
-<?php foreach ($findings['B']['findings'] as $f): ?>
-      <tr>
-        <td><?= e($f['model']) ?></td>
-        <td><?= $f['out_frac'] ?>%</td>
-        <td><?= dollar($f['cost']) ?></td>
-      </tr>
-<?php endforeach; ?>
-    </table>
+  <div class="finding">
+    <h3><span>Frontier model on tolerant work</span><span class="drain"><?= usd($report['headline_save']) ?></span></h3>
+    <?php if ($report['downshift_rows']): ?>
+      <table>
+        <thead><tr><th>Model</th><th>Downshift to</th><th class="num">Current</th><th class="num">Recoverable</th></tr></thead>
+        <tbody>
+        <?php foreach ($report['downshift_rows'] as $r): ?>
+          <tr><td class="mono"><?= h($r['model']) ?></td><td class="mono"><?= h($r['to']) ?></td><td class="num"><?= usd($r['cost']) ?></td><td class="num"><?= usd($r['save']) ?></td></tr>
+        <?php endforeach; ?>
+        </tbody>
+      </table>
+    <?php else: ?>
+      <p class="note">No model with a cheaper downshift target detected in this data.</p>
+    <?php endif; ?>
+    <div class="tags"><span class="tag eval">needs eval</span><span class="tag">effort: med</span></div>
+    <p class="note">This is the ceiling — confirm with a 50–500 case eval before downgrading; some traffic genuinely needs the bigger model.</p>
   </div>
-<?php endif; ?>
 
-<?php if (isset($findings['C'])): ?>
-  <div class="finding rule-c">
-    <div class="finding-head">
-      <span class="finding-badge badge-c">Rule C</span>
-      <h3><?= e($findings['C']['title']) ?></h3>
-      <span class="effort eff-l">Low Effort</span>
-      <span class="effort eff-l">Low Risk</span>
+  <div class="finding">
+    <h3><span>Output cost share</span><span class="drain"><?= number_format($ocs,0) ?>%</span></h3>
+    <div class="bar"><span style="width:<?= $ocs ?>%"></span></div>
+    <div class="tags">
+      <span class="tag <?= $ocs > 50 ? 'risk':'safe' ?>"><?= $ocs > 50 ? 'output-heavy':'output in range' ?></span>
+      <span class="tag">output:input ratio <?= number_format($ratio,2) ?>×</span>
+      <span class="tag">effort: low</span>
     </div>
-    <p>Your export shows <?= $findings['C']['has_cached'] ? 'some' : 'no' ?> cached tokens out of <strong><?= fmt($findings['C']['total_in']) ?></strong> input tokens. Enable prompt caching on compatible platforms to reduce input costs by up to 50-90% on repeat patterns.</p>
+    <p class="note">Output tokens cost several times input. Every 20% trimmed off output ≈ <?= usd($report['output_save_per_20']) ?> over this period. (Share is output cost ÷ total spend; the <?= number_format($ratio,2) ?>× figure is output tokens per input token — a ratio, which is why it can exceed 100%.)</p>
   </div>
-<?php endif; ?>
-</div>
 
-<div class="disclaimer">
-  <strong>Methodology note:</strong> All findings are computed from your uploaded CSV using static pricing from <code>pricing.json</code>. Savings figures are <em>opportunity ceilings</em> that require validation before any change is made to production systems. This tool does not call any LLM API.
-</div>
+  <div class="finding">
+    <h3><span>Prompt caching</span><span class="drain"><?= $report['cache_flag'] ? 'opportunity':'—' ?></span></h3>
+    <div class="tags"><span class="tag <?= $report['cache_flag']?'risk':'safe' ?>"><?= $report['cache_flag']?'likely savings':'in use' ?></span><span class="tag">effort: low</span></div>
+    <p class="note"><?= h($report['cache_note']) ?></p>
+  </div>
 
-<div style="display:flex;gap:12px;flex-wrap:wrap">
-  <button class="btn btn-primary" onclick="window.print()">Download Report (Print/PDF)</button>
-  <a href="?reset=1" class="btn btn-ghost">Analyze Another File</a>
-</div>
+  <div class="finding">
+    <h3><span>Batch-eligible workload?</span><span class="drain">investigate</span></h3>
+    <div class="tags"><span class="tag">~50% off batch</span><span class="tag">effort: low</span></div>
+    <p class="note"><?= h($report['batch_note']) ?></p>
+  </div>
+
+  <?php if (!empty($report['unpriced'])): ?>
+    <p class="note">No rate-card match for <?= h(implode(', ', $report['unpriced'])) ?>. Add them to <span class="mono">pricing.json</span> for full coverage.</p>
+  <?php endif; ?>
+
+  <p style="margin-top:24px"><a href="/">Run another export</a></p>
 <?php endif; ?>
-</main>
+
+  <p class="foot">Processed in memory. Nothing stored.</p>
+</div>
 </body>
 </html>
